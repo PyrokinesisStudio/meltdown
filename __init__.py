@@ -728,7 +728,7 @@ class MeltdownBakeOp(Operator):
             blocks = getattr(bpy.data, attr)
             for block in blocks:
                 if block.name.endswith("MD_TMP"):
-                    blocks.remove(block)
+                    blocks.remove(block, do_unlink=True)
                 else:
                     del block["md_orig_name"]
         
