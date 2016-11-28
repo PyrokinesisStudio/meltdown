@@ -33,7 +33,7 @@ bl_info = {
 import code
 import os
 import bpy
-from bpy.types import PropertyGroup, Operator, Panel
+from bpy.types import PropertyGroup, Operator, Panel, AddonPreferences
 from bpy.props import BoolProperty, IntProperty, EnumProperty, FloatProperty, StringProperty, CollectionProperty, PointerProperty
 from bpy.utils import register_class, unregister_class
 from progress_report import ProgressReport
@@ -306,10 +306,11 @@ class BakePass(PropertyGroup):
         
     def get_blend_mode(self):
         pass_fullname = self.get_pass_fullname()
+        if "DIRECT" in pass_fullname or "INTENSITY" in pass_fullname:
+            return 'ADD'       
         if "COLOR" in pass_fullname or self.pass_name in ["SHADOW","AO"]:
             return 'MULTIPLY'
-        if "DIRECT" in pass_fullname or "INTENSITY" in pass_fullname:
-            return 'ADD'
+
         return 'MIX'
     
     def get_fileext(self, job):
@@ -390,12 +391,22 @@ class MeltdownBakeOp(Operator):
                 slot.link = 'DATA'
                 
     def create_temp_tex(self, bakepass, lowpoly):
-        
+        print("create_temp_tex")
         tex = None
-        
+        no_materials = True
         for bake_mat in lowpoly.data.materials:
-            lowpoly.active_material = bake_mat
-            break;
+            if bake_mat is not None:
+                lowpoly.active_material = bake_mat
+                no_materials = False
+                break;
+                
+        if no_materials:
+            temp_mat = bpy.data.materials.new("Meltdown_MD_TMP")
+            # use nodes by default for cycles only
+            temp_mat.use_nodes = bakepass.engine != "BLENDER_RENDER"
+            lowpoly.data.materials.append(temp_mat)
+            lowpoly.active_material = temp_mat
+               
         if bakepass.engine == 'BLENDER_RENDER':
             for uvtex in lowpoly.data.uv_textures:
                 if uvtex.name == 'Auto-Unwrap':
@@ -406,31 +417,34 @@ class MeltdownBakeOp(Operator):
             #add an image node to every lowpoly model's materials
             for bake_mat in lowpoly.data.materials:
                 
-                # add other engines here
- 
-                bake_mat.use_nodes = True
-                if "MDtarget" not in bake_mat.node_tree.nodes:
-                    tex = bake_mat.node_tree.nodes.new(type = "ShaderNodeTexImage")
-                    tex.name = 'MDtarget'
-                    uvtex = bake_mat.node_tree.nodes.new(type = "ShaderNodeUVMap")
-                    uvtex.uv_map = 'Auto-Unwrap'
-                    bake_mat.node_tree.links.new(uvtex.outputs[0], tex.inputs[0])
-                else:
-                    tex = bake_mat.node_tree.nodes["MDtarget"]
-                tex.image = bpy.data.images["MDtarget"]
-                bake_mat.node_tree.nodes.active = tex
+                if bake_mat is not None:
+                    # add other engines here
+     
+                    bake_mat.use_nodes = True
+                    if "MDtarget" not in bake_mat.node_tree.nodes:
+                        tex = bake_mat.node_tree.nodes.new(type = "ShaderNodeTexImage")
+                        tex.name = 'MDtarget'
+                        uvtex = bake_mat.node_tree.nodes.new(type = "ShaderNodeUVMap")
+                        uvtex.uv_map = 'Auto-Unwrap'
+                        bake_mat.node_tree.links.new(uvtex.outputs[0], tex.inputs[0])
+                    else:
+                        tex = bake_mat.node_tree.nodes["MDtarget"]
+                    tex.image = bpy.data.images["MDtarget"]
+                    bake_mat.node_tree.nodes.active = tex
                     
             if tex is not None:
                 bake_mat = lowpoly.active_material
                 bake_mat.node_tree.nodes.active = tex
-                    
+                
     # 1
     def create_render_target(self, job):
+        print("create_render_target")
         bpy.ops.image.new(name="MDtarget", width= job.get_render_resolution()[0], \
         height = job.get_render_resolution()[1], \
         color=(0.0, 0.0, 0.0, 0.0), alpha=True, generated_type='BLANK', float=False)
         
     def cleanup_render_target(self, job, bakepass, pair):
+        print("cleanup_render_target")
         baketarget = bpy.data.images["MDtarget"]
         
         # call compo trees here
@@ -561,7 +575,7 @@ class MeltdownBakeOp(Operator):
         object.select = True
     # 4       
     def prepare_scene(self, scene, job, bakepass, pair):
-        
+        print("prepare_scene")
         
         self.copy_engine_settings(scene, job, bakepass)
         
@@ -620,20 +634,12 @@ class MeltdownBakeOp(Operator):
 
     # 3 bake a pair
     def bake_set(self, scene, job, bakepass, pair):
-        
+        print("bake_set")
         no_materials = False
         
         #ensure lowpoly has material
         lowpoly = scene.objects[pair.lowpoly+"_MD_TMP"]
         
-        if len(lowpoly.data.materials) == 0 \
-            or lowpoly.material_slots[0].material == None:
-            no_materials = True
-            temp_mat = bpy.data.materials.new("Meltdown_MD_TMP")
-            # use nodes by default for cycles only
-            temp_mat.use_nodes = bakepass.engine != "BLENDER_RENDER"
-            lowpoly.data.materials.append(temp_mat)
-            lowpoly.active_material = temp_mat
         
         #lowpoly.select = True
         #scene.objects.active = lowpoly
@@ -667,7 +673,7 @@ class MeltdownBakeOp(Operator):
       
     # 2
     def bake_pass(self, progress, src_scene, job, bakepass):
-        
+        print("bake_pass")
         #the pair counter is used to determine whether to clear the image
         #set it to 0 after each bake pass
         bakepass.pair_counter = 0
@@ -695,57 +701,73 @@ class MeltdownBakeOp(Operator):
         progress.leave_substeps()
         
     def remove_object(self, object):
-                
         if bpy.data.objects.find(object.name) > -1:
             
             data = object.data
-            name = data.name
-            
+               
             bpy.data.scenes["MD_TMP"].objects.unlink(object)
             bpy.data.objects.remove(object)
             
+            if data is None:
+                return
+            
+            name = data.name
             attrs = ["meshes", "lamps", "cameras", "curves", "texts", "metaballs", "lattices", "armatures", "speakers"]
             for attr in attrs:
                 blocks = getattr(bpy.data, attr)
                 if blocks.find(name) > -1:
                     if not data.users:
-                        blocks.remove(data)
-                    return 
+                        blocks.remove(data, do_unlink=True)
+            return 
         
     def cleanup(self, scene):
-        
+        print("cleanup")
         # realy clean up everything, still left to check for particles
-        
         attrs = ["materials", "textures", "images", "groups"]
         
+        print("cleanup remove_objects")
         for object in scene.objects:
             self.remove_object(object)
             
+        print("cleanup remove_scene")
+        bpy.data.scenes.remove(scene, do_unlink=True)    
+        
         for object in bpy.data.objects:
-            del object["md_orig_name"]
-            
+            if hasattr(object, "md_orig_name"):
+                del object["md_orig_name"]
+                
+        print("cleanup remove_blocks")    
         for attr in attrs:
             blocks = getattr(bpy.data, attr)
             for block in blocks:
                 if block.name.endswith("MD_TMP"):
                     blocks.remove(block, do_unlink=True)
                 else:
-                    del block["md_orig_name"]
+                    if hasattr(object, "md_orig_name"):    
+                        del block["md_orig_name"]
+                        
+        print("cleanup remove_linestyles and curves")
+        for attr in ["linestyles", "curves"]:
+            blocks = getattr(bpy.data, attr)
+            for block in blocks:
+                if not block.users:
+                    blocks.remove(block, do_unlink=True)
         
+        print("cleanup remove_world")
         # Dirty hack to clean world's user - as i don't know who is using it
-        bpy.data.worlds["MD_TMP"].user_clear()
-        bpy.data.worlds.remove(bpy.data.worlds["MD_TMP"])
-        
-        bpy.ops.scene.delete()
-           
+        # bpy.data.worlds["MD_TMP"].user_clear()
+        bpy.data.worlds.remove(bpy.data.worlds["MD_TMP"], do_unlink=True)
+                 
     def compo_nodes_margin(self, job, bakepass, pair, targetimage):
-       
+        print("compo_nodes_margin")
         bpy.ops.scene.new(type = "EMPTY")
         bpy.context.scene.name = "MD_COMPO"
         scene = bpy.context.scene
         
         # make sure the compositor is using nodes
         scene.use_nodes = True
+        # make sure the scene use compositor
+        scene.render.use_compositing = True
         scene.render.resolution_x = job.resolution_x
         scene.render.resolution_y = job.resolution_y
         scene.render.resolution_percentage = 100
@@ -876,9 +898,7 @@ class MeltdownBakeOp(Operator):
             # Show up result
             bpy.ops.meltdown.switch_materials(engine='BLENDER_RENDER', link='OBJECT',all_objects=False)
             progress.leave_substeps("Finished !")
-        
-
-        
+               
         return {'FINISHED'}
 
 class MeltdownAddPairOp(Operator):
@@ -965,18 +985,14 @@ class MeltdownUnwrap(Operator):
         ob.update_from_editmode()
         for uvtex in ob.data.uv_textures:
             if uvtex.name == 'Auto-Unwrap':
+                uvtex.active = True
                 bpy.ops.object.mode_set(mode='OBJECT')
                 self.report({'INFO'}, "Auto Unwrap found skipping.")
                 return {'FINISHED'}
         bpy.ops.mesh.uv_texture_add()
         ob.data.uv_textures[len(ob.data.uv_textures)-1].name = 'Auto-Unwrap'
         ob.data.uv_textures[len(ob.data.uv_textures)-1].active = True
-        seams = 0
-        for e in mesh.edges:
-            if e.use_seam:
-                seams = 1
-                break
-        if seams:
+        if setup.auto_unwrap == 'UNWRAP':
             bpy.ops.uv.unwrap()
             self.report({'INFO'}, "Reset UVS using your marked seams.")
         else: 
@@ -1168,9 +1184,21 @@ class MeltdownMakeBIMaterialOp(Operator):
                 mat.diffuse_color = (0,0,0)
                 mat.use_shadeless = True
                 
+                # note : cleanup textures and maps here
                 for i, slot in enumerate(mat.texture_slots):
                     if slot is not None:
                         mat.texture_slots.clear(i)
+                
+                # realy clean up everything, still left to check for particles
+                attrs = ["textures", "images"]
+                
+                print("cleanup old baked textures and images")    
+                for attr in attrs:
+                    blocks = getattr(bpy.data, attr)
+                    for block in blocks:
+                        if block.users < 1:
+                            blocks.remove(block, do_unlink=True)
+                        
                 bakepasses = self.sort_bake_passes(job.bakepasses)
 
                 # Setup Blender Internal material with baked maps
@@ -1280,7 +1308,7 @@ class SmartUnwrapProps(PropertyGroup):
     bl_idname = 'meltdown.smart_unwrap'
     
     angle_limit = FloatProperty(name="Angle Limit", description="", default=66, min = 1.0, max = 89.0)
-    island_margin = FloatProperty(name="Island Margin", description="", default=0, min = 0.0, max = 1.0)
+    island_margin = FloatProperty(name="Island Margin", description="", default=0.06, min = 0.0, max = 1.0)
     user_area_weight = FloatProperty(name="Area Weight", description="", default=0, min = 0.0, max = 1.0)
     use_aspect = BoolProperty(name = "Correct Aspect", default = True)
     stretch_to_bounds = BoolProperty(name = "Stretch to UV Bounds", default = True)
@@ -1366,7 +1394,8 @@ class MeltdownSetup(PropertyGroup):
     bl_idname = 'meltdown.setup_properties'
     auto_unwrap = EnumProperty(name="Unwrap", description="", default="SMART", 
         items = (('SMART', 'Smart uv', ''),
-                 ('LIGHTMAP', 'Lightmap', '')))
+                 ('LIGHTMAP', 'Lightmap', ''),
+                 ('UNWRAP', 'Unwrap', '')))
     
     lightmap_unwrap = PointerProperty(type=LightmapUnwrapProps)
     smart_unwrap = PointerProperty(type=SmartUnwrapProps)
@@ -1655,7 +1684,14 @@ class MeltdownJobsPanel(bpy.types.Panel):
                     row = layout.row(align=True)
                     row.alignment = 'EXPAND'
                     box = row.box().column(align=True)
+                    box.separator()
                     bakepass.draw(box)
+                    col = row.column()
+                    row = col.row()
+                    if bakepass.activated:
+                        row.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_OFF", emboss = False)
+                    else:
+                        row.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_ON", emboss = False)
                       
                 row = layout.row(align=True)
                 row.alignment = 'EXPAND'
@@ -1670,6 +1706,42 @@ class MeltdownJobsPanel(bpy.types.Panel):
         row.alignment = 'EXPAND'
         row.operator("meltdown.add_job", icon = "ZOOMIN")
 
+        
+def update_panel(self, context):
+    try:
+        bpy.utils.unregister_class(MeltdownSetupPanel)
+        bpy.utils.unregister_class(MeltdownJobsPanel)
+    except:
+        pass
+    MeltdownSetupPanel.bl_category = context.user_preferences.addons[__name__].preferences.category
+    MeltdownJobsPanel.bl_category = context.user_preferences.addons[__name__].preferences.category
+    bpy.utils.register_class(MeltdownSetupPanel)
+    bpy.utils.register_class(MeltdownJobsPanel)
+
+
+class MeltdownPref(AddonPreferences):
+    bl_idname = __name__
+
+    category = StringProperty(
+            name="Rename Tab Category",
+            description="Choose a name for the category of the panel",
+            default="Baking",
+            update=update_panel
+            )
+
+    def draw(self, context):
+        layout = self.layout
+        split_percent = 0.15
+
+        split = layout.split(percentage=split_percent)
+        col = split.column()
+        col.label(text="Rename Tab Category:")
+        col = split.column()
+        colrow = col.row()
+        colrow.alignment = 'LEFT'
+        colrow.prop(self, "category", text="")        
+
+        
 def register():
     register_class(BakePair)    
     register_class(BakePass)            
@@ -1677,7 +1749,8 @@ def register():
     register_class(SmartUnwrapProps)
     register_class(LightmapUnwrapProps)
     register_class(MeltdownSettings)
-    register_class(MeltdownSetup)     
+    register_class(MeltdownSetup)
+    register_class(MeltdownPref)
     bpy.types.Scene.meltdown_setup = PointerProperty(type = MeltdownSetup)
     bpy.types.Scene.meltdown_settings = PointerProperty(type = MeltdownSettings)
     bpy.utils.register_module(__name__)
@@ -1696,6 +1769,7 @@ def unregister():
     unregister_class(BakePair)    
     unregister_class(BakePass)            
     unregister_class(BakeJob)
+    unregister_class(MeltdownPref)
     bpy.utils.unregister_module(__name__)
     del bpy.types.Scene.meltdown_setup
     del bpy.types.Scene.meltdown_settings
