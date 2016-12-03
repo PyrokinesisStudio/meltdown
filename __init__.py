@@ -37,6 +37,59 @@ from bpy.types import PropertyGroup, Operator, Panel, AddonPreferences
 from bpy.props import BoolProperty, IntProperty, EnumProperty, FloatProperty, StringProperty, CollectionProperty, PointerProperty
 from bpy.utils import register_class, unregister_class
 from progress_report import ProgressReport
+import blf
+import time
+import hashlib
+from mathutils import Matrix
+
+class MeltdownOsd():
+    """Hackish on screen display"""
+    _msg = ""
+    _obj = ""
+    _passe = ""
+    
+    def start(self):
+        self._handle = bpy.types.SpaceView3D.draw_handler_add(self._draw_handler, tuple(), 'WINDOW', 'POST_PIXEL')
+        
+    def end(self):
+        if not self._handle: return
+        self.clean()
+        bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
+    def _draw_handler(self):
+        blf.size(0,18,72)
+        blf.position(0,60,100,0)
+        blf.draw(0,self._msg)
+        blf.position(0,60,130,0)
+        blf.draw(0,self._obj)  
+        blf.position(0,60,160,0)
+        blf.draw(0,self._passe)
+    
+    def show(self,msg,obj,passe):
+        self._msg = str(msg)
+        self._obj = str(obj)
+        self._passe = str(passe)
+        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
+    def clean(self):
+        self._msg = str()
+        self._obj = str()
+        self._passe = str()
+        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+        
+    def update(self, progress, obj="", passe=""):
+        steps = sum(s * cs for (s, cs) in zip(progress.steps, progress.curr_step))
+        steps_percent = steps / progress.steps[0] * 100.0
+        tm = time.time()
+        loc_tm = tm - progress.start_time[-1]
+        tm -= progress.start_time[0]
+        prefix = "  " * (len(progress.steps) - 1)
+        self.show(prefix + "(%8.4f sec | %8.4f sec) %6.2f%%" % (tm, loc_tm,steps_percent), obj, passe)
+            
+# Global name
+meltdown_osd = MeltdownOsd()
+            
 
 class BakePair(PropertyGroup):
     activated = BoolProperty(name = "Activated", description="Pair on/off", default = True)
@@ -130,7 +183,7 @@ class BakePass(PropertyGroup):
     influence = FloatProperty(name="Texture influence", description="BI texture influence", default=1.0, min=0.0)    
     material_override = StringProperty(name="Material Override", description="", default="")
     ao_distance = FloatProperty(name="Distance", description="", default=10.0, min=0.0)
-    samples = IntProperty(name="Samples", description="", default=1)
+    samples = IntProperty(name="Samples", description="", default=4)
     clean_environment = BoolProperty(name = "Clean Environment", default = False)
     
     # cycles baking props
@@ -318,20 +371,20 @@ class BakePass(PropertyGroup):
         for formats in enum_file_formats:
             if formats[0] == format:
                 return formats[1]
+ 
+    def make_filename(self, job):
+        filename = job.make_filename(bpy.context)
+        return filename
         
-    def get_filepath(self, job, pair):
+    def get_filepath(self, job):
         path = job.output 
         if path[-1:] != os.path.sep:
             path = path + os.path.sep
-        path = path + bpy.path.clean_name(pair.lowpoly, "_")
-        pass_fullname = self.get_pass_fullname()
-        if len(pass_fullname)>0:
-            path += "_" + pass_fullname.lower()
-        path += self.get_fileext(job)
+        path = path + self.get_filename(job)
         return path
 
-    def get_filename(self, job, pair):
-        name = bpy.path.clean_name(pair.lowpoly, "_")
+    def get_filename(self, job):
+        name = self.make_filename(job)
         pass_fullname = self.get_pass_fullname()
         if len(pass_fullname)>0:
             name += "_" + pass_fullname.lower()
@@ -341,9 +394,13 @@ class BakePass(PropertyGroup):
 class BakeJob(PropertyGroup):
     activated = BoolProperty(name = "Activated", default = True)
     expand = BoolProperty(name = "Expand", default = True)
-    resolution_x = IntProperty(name="Resolution X", default = 1024)
-    resolution_y = IntProperty(name="Resolution Y", default = 1024)
-    antialiasing = BoolProperty(name="4x Antialiasing", description="", default=False)
+    expand_passes = BoolProperty(name = "Expand passes", default = True)
+    resolutionX = IntProperty(name="Resolution X", default = 1024)
+    resolutionY = IntProperty(name="Resolution Y", default = 1024)
+    antialiasing = bpy.props.EnumProperty(name = "Anti-aliasing", default = "0",
+                                    items = (("0","None",""),
+                                            ("2", "2x", ""),
+                                             ("4","4x","")))
     aa_sharpness = FloatProperty(name="AA Sharpness", description="", default=0.5, min = 0.0, max = 1.0)
     
     margin = IntProperty(name="Margin", default = 16, min = 0)
@@ -359,17 +416,38 @@ class BakeJob(PropertyGroup):
     pairs = CollectionProperty(type=BakePair)
     bakepasses = CollectionProperty(type=BakePass)
     
-    def get_render_resolution(self):
-        if self.antialiasing == True:
-            return [self.resolution_x * 2, self.resolution_y * 2]
+    def make_filename(self, context):
+        scene = context.scene
+        filename = ""
+        if len(self.pairs) > 1:
+            if hasattr(scene, "ms_lightmap_groups"):        
+                textureAtlasGroupsNames = [group.name for group in scene.ms_lightmap_groups]        
+                for pair in self.pairs:
+                    for group in bpy.data.objects[pair.lowpoly].users_group:
+                        if group.name in textureAtlasGroupsNames:
+                            filename = bpy.path.clean_name(group.name, "_")
+                            break
+            else:
+                for pair in self.pairs:
+                    filename += pair.lowpoly
+                    filename = "Atlas_" + hashlib.md5(filename.encode('utf-8')).hexdigest()
         else:
-            return [self.resolution_x, self.resolution_y]
-        
-        
+            filename = bpy.path.clean_name(self.pairs[0].lowpoly, "_")
+        return filename   
+    
+    def get_render_resolution(self):
+        if self.antialiasing == '0':
+            return [self.resolutionX, self.resolutionY]
+        if self.antialiasing == '2':
+            return [self.resolutionX * 2, self.resolutionY * 2]
+        if self.antialiasing == '4':
+            return [self.resolutionX * 4, self.resolutionY * 4]
+       
 class MeltdownSettings(PropertyGroup):
     bl_idname = __name__
     jobs = CollectionProperty(type=BakeJob)
 
+    
 class MeltdownBakeOp(Operator):
     '''Process baking jobs'''
 
@@ -382,15 +460,8 @@ class MeltdownBakeOp(Operator):
 
     bake_all = BoolProperty()
     bake_target = StringProperty()
-    
-    def remove_baked_mat(self, scene):
-        for obj in scene.objects:
-            for name, slot in obj.material_slots.items():
-                slot.link = 'OBJECT'
-                slot.material = None
-                slot.link = 'DATA'
-                
-    def create_temp_tex(self, bakepass, lowpoly):
+               
+    def create_temp_tex(self, bakepass, lowpoly, uvtex_name):
         print("create_temp_tex")
         tex = None
         no_materials = True
@@ -409,7 +480,7 @@ class MeltdownBakeOp(Operator):
                
         if bakepass.engine == 'BLENDER_RENDER':
             for uvtex in lowpoly.data.uv_textures:
-                if uvtex.name == 'Auto-Unwrap':
+                if uvtex.name == uvtex_name:
                     uvtex.active = True
                     for d in uvtex.data:
                         d.image = bpy.data.images["MDtarget"]
@@ -425,7 +496,7 @@ class MeltdownBakeOp(Operator):
                         tex = bake_mat.node_tree.nodes.new(type = "ShaderNodeTexImage")
                         tex.name = 'MDtarget'
                         uvtex = bake_mat.node_tree.nodes.new(type = "ShaderNodeUVMap")
-                        uvtex.uv_map = 'Auto-Unwrap'
+                        uvtex.uv_map = uvtex_name
                         bake_mat.node_tree.links.new(uvtex.outputs[0], tex.inputs[0])
                     else:
                         tex = bake_mat.node_tree.nodes["MDtarget"]
@@ -439,16 +510,21 @@ class MeltdownBakeOp(Operator):
     # 1
     def create_render_target(self, job):
         print("create_render_target")
+        
+        imageIdx = bpy.data.images.find("MDtarget")
+        if imageIdx > -1:
+            bpy.data.images.remove(bpy.data.images[imageIdx], do_unlink=True)
+            
         bpy.ops.image.new(name="MDtarget", width= job.get_render_resolution()[0], \
         height = job.get_render_resolution()[1], \
         color=(0.0, 0.0, 0.0, 0.0), alpha=True, generated_type='BLANK', float=False)
         
-    def cleanup_render_target(self, job, bakepass, pair):
+    def cleanup_render_target(self, job, bakepass):
         print("cleanup_render_target")
         baketarget = bpy.data.images["MDtarget"]
         
         # call compo trees here
-        self.compo_nodes_margin(job, bakepass, pair, baketarget)
+        self.compo_nodes_margin(job, bakepass, baketarget)
         
         #unlink from image editors
         for wm in bpy.data.window_managers:
@@ -456,12 +532,27 @@ class MeltdownBakeOp(Operator):
                 for area in window.screen.areas:
                     if area.type == "IMAGE_EDITOR":
                         area.spaces[0].image = None
+                        
+        bpy.data.images.remove(baketarget, do_unlink=True)
         
     # def apply_modifiers(self):
     
     # def merge_group(self):
-    
-    def scene_copy(self, scene):
+    def make_duplicates_real(self, scene, pair, object, highPolyGroup, oldMatrix, is_parentHipolyMember):
+        new_matrix = oldMatrix*object.matrix_world  #to store combination of parent groups matrices
+        for dupObj in object.dupli_group.objects:
+            if dupObj.type == 'EMPTY' and dupObj.dupli_group:
+                self.make_duplicates_real(scene, pair, dupObj, highPolyGroup, new_matrix, is_parentHipolyMember)
+            else:
+                copyDupObj = dupObj.copy()
+                copyDupObj.name += "_MD_TMP"
+                scene.objects.link(copyDupObj)
+                if is_parentHipolyMember: #if parent was in hipoly group/obj then link child to hipoly to
+                    highPolyGroup.objects.link(copyDupObj)
+                copyDupObj.matrix_world = new_matrix * copyDupObj.matrix_world
+
+
+    def scene_copy(self, scene, pair):
         # store the original names of things in the scene so we can easily identify them later
         for object in scene.objects:
             object["md_orig_name"] = object.name
@@ -491,11 +582,33 @@ class MeltdownBakeOp(Operator):
                     block.name = block["md_orig_name"] + "_MD_TMP"
                     
         # unique name for world settings as we do use it when setting up scene        
-        for block in bpy.data.worlds:
-            if block["md_orig_name"] != block.name:
-                block.name = "MD_TMP"
-               
-        return tmp_scene
+        for world in bpy.data.worlds:
+            if world["md_orig_name"] != world.name:
+                world.name = "MD_TMP"
+        
+        highPolyGroup = None
+        
+        if pair.highpoly != "":
+            if pair.hp_obj_vs_group == "GRP":
+                highPolyGroup = bpy.data.groups[pair.highpoly+"_MD_TMP"]
+            else:
+                highPolyGroup = bpy.data.groups.new(pair.highpoly+"_NoGroup_MD_TMP")  #create group with obj name
+                highPolyGroup.objects.link(tmp_scene.objects[pair.highpoly+"_MD_TMP"])
+            
+        #make highpoly dupli instances real        
+        for object in tmp_scene.objects: 
+            if object.type == 'EMPTY' and object.dupli_group:
+                
+                if pair.highpoly != "": #link obj's from group pro to hipoly group if obj is member of hipoly bake group
+                    if any(groupMember == object for groupMember in highPolyGroup.objects):
+                        self.make_duplicates_real(tmp_scene, pair, object, highPolyGroup, Matrix.Identity(4),True)  # true  = obj is in baking group (so childs should too)
+                    else:
+                        self.make_duplicates_real(tmp_scene, pair, object, highPolyGroup, Matrix.Identity(4),False)
+                
+                tmp_scene.objects.unlink(object) #remove empty from baking
+                bpy.data.objects.remove(object, do_unlink=True)
+
+        return tmp_scene, highPolyGroup
             
     def copy_engine_settings(self, scene, job, bakepass):
         #copy pass settings to cycles settings
@@ -513,9 +626,8 @@ class MeltdownBakeOp(Operator):
             scene.render.bake_normal_space = bakepass.nm_space
             
         # add other engines here
-    
-    
-    def pass_material_id_prep(self, scene, pair):
+      
+    def pass_material_id_prep(self, scene, pair, highPolyGroup):
         
         def change_material(hp):
             for slot in hp.material_slots:
@@ -538,13 +650,10 @@ class MeltdownBakeOp(Operator):
         
         
         if pair.highpoly != "":
-            if pair.hp_obj_vs_group == "GRP":
-                for object in bpy.data.groups[pair.highpoly+"_MD_TMP"].objects:
-                    change_material(object)
-            else:
-                change_material(hp = scene.objects[pair.highpoly+"_MD_TMP"])
-            
-            
+            for object in highPolyGroup.objects:
+                change_material(object)
+           
+                     
     def prepare_multires(self, scene, job, bakepass, pair):
         # Build a highpoly setup from lowpoly with multires modifier
         
@@ -574,7 +683,7 @@ class MeltdownBakeOp(Operator):
         object.layers[0] = True
         object.select = True
     # 4       
-    def prepare_scene(self, scene, job, bakepass, pair):
+    def prepare_scene(self, scene, job, bakepass, pair, highPolyGroup):
         print("prepare_scene")
         
         self.copy_engine_settings(scene, job, bakepass)
@@ -582,13 +691,8 @@ class MeltdownBakeOp(Operator):
         # make selections, ensure visibility
         bpy.ops.object.select_all(action='DESELECT')
         
-        
         if pair.highpoly != "":
-            if pair.hp_obj_vs_group == "GRP":
-                for object in bpy.data.groups[pair.highpoly+"_MD_TMP"].objects:
-                    self.use_object(object)
-            else:
-                object = self.tmp_scene.objects[pair.highpoly+"_MD_TMP"]
+            for object in highPolyGroup.objects:
                 self.use_object(object)
         else:
             pair.use_hipoly = False
@@ -608,12 +712,9 @@ class MeltdownBakeOp(Operator):
             if bakepass.environment_highpoly:
                 # iterate over objects designated as highpoly and select them
                 for pair in job.pairs:
-                    if pair.hp_obj_vs_group == "GRP":
-                        for object in  bpy.data.groups[pair.highpoly+"_MD_TMP"].objects:
-                            self.use_object(object)
-                    else:
-                        object = scene.objects[pair.highpoly+"_MD_TMP"]
+                    for object in highPolyGroup.objects:
                         self.use_object(object)
+                    
             else:
                 # select objects in environment group if set
                 if bakepass.environment_group != "":
@@ -621,16 +722,13 @@ class MeltdownBakeOp(Operator):
                         self.use_object(object)
         
         # remove unnecessary objects
-        if bakepass.environment_group != "" \
-        or bakepass.clean_environment \
-        or bakepass.environment_highpoly: #do not remove if environment group empty
-            for object in scene.objects:
-                if object.select == False:
-                    self.remove_object(object)
+        for object in scene.objects:
+            if object.select == False:
+                self.remove_object(object)
         
         # cycles based material id pass
         if bakepass.pass_name == "MAT_ID":
-            self.pass_material_id_prep(scene, pair)
+            self.pass_material_id_prep(scene, pair, highPolyGroup)
 
     # 3 bake a pair
     def bake_set(self, scene, job, bakepass, pair):
@@ -640,10 +738,20 @@ class MeltdownBakeOp(Operator):
         #ensure lowpoly has material
         lowpoly = scene.objects[pair.lowpoly+"_MD_TMP"]
         
+        lowpoly.select = True
+        scene.objects.active = lowpoly
         
-        #lowpoly.select = True
-        #scene.objects.active = lowpoly
-        self.create_temp_tex(bakepass, lowpoly)
+        # Check for texture atlas group membership
+        # and use group name as uvtex_name if any
+        uvtex_name = 'Auto-Unwrap'
+        if hasattr(scene, "ms_lightmap_groups"):        
+            textureAtlasGroupsNames = [group.name for group in scene.ms_lightmap_groups]        
+            for group in lowpoly.users_group:
+                if group.name in textureAtlasGroupsNames:
+                    uvtex_name = group.name
+                    break
+                    
+        self.create_temp_tex(bakepass, lowpoly, uvtex_name)
         
         if pair.extrusion_vs_cage == "CAGE":
             pair_use_cage = True
@@ -664,40 +772,53 @@ class MeltdownBakeOp(Operator):
             bake_type, pass_filter = bakepass.get_cycles_pass_type()          
             bpy.ops.object.bake(type=bake_type, pass_filter=pass_filter, \
             filepath="", \
-            width=job.get_render_resolution()[0], height=job.get_render_resolution()[1], margin=0, \
+            width=job.get_render_resolution()[0], height=job.get_render_resolution()[1], margin=job.margin, \
             use_selected_to_active=pair.use_hipoly, cage_extrusion=pair.extrusion, cage_object=pair.cage, \
             normal_space=bakepass.nm_space, \
             normal_r=bakepass.normal_r, normal_g=bakepass.normal_g, normal_b=bakepass.normal_b, \
             save_mode='INTERNAL', use_clear=clear, use_cage=pair_use_cage, \
             use_split_materials=False, use_automatic_name=False)
-      
+        
+        
     # 2
-    def bake_pass(self, progress, src_scene, job, bakepass):
+    def bake_pass(self, context, progress, src_scene, job, bakepass):
         print("bake_pass")
         #the pair counter is used to determine whether to clear the image
         #set it to 0 after each bake pass
         bakepass.pair_counter = 0
+        pairs = [pair for pair in job.pairs if pair.activated]
         
         # Tag baked objects
-        for pair in job.pairs:
+        for pair in pairs:
             if pair.activated:
                 src_scene.objects[pair.lowpoly]["bake_object"] = True
                 
         # Switch engine and material sources
         bpy.ops.meltdown.switch_materials(engine=bakepass.engine, link='DATA',all_objects=False)
-        pairs = [pair for pair in job.pairs if pair.activated]
+        
         progress.enter_substeps(len(pairs))
-                    
+        self.create_render_target(job)
+        
         for pair in pairs: 
-            progress.step()  
-            self.create_render_target(job)    
-            tmp_scene = self.scene_copy(src_scene)
-            #self.remove_baked_mat(tmp_scene)
+            
+            progress.step() 
+            meltdown_osd.update(progress, obj=("Object: %s" % (pair.lowpoly)), passe=("Pass: %s" % (bakepass.pass_name)))
+            
+            if context.area is not None:
+                context.area.tag_redraw()
+                
+            tmp_scene, highPolyGroup = self.scene_copy(src_scene, pair)
+            
             self.prepare_multires(tmp_scene, job, bakepass, pair)
-            self.prepare_scene(tmp_scene, job, bakepass, pair)
+            self.prepare_scene(tmp_scene, job, bakepass, pair, highPolyGroup)
             self.bake_set(tmp_scene, job, bakepass, pair)
+            # update context (attempt to prevent ACCESS_VIOLATION on scenes.remove() 2.78a windows 10)
+            bpy.context.screen.scene = src_scene            
             self.cleanup(tmp_scene)
-            self.cleanup_render_target(job, bakepass, pair)
+        
+        # out of pairs loop to support Atlas mode    
+        self.cleanup_render_target(job, bakepass)
+        
         progress.leave_substeps()
         
     def remove_object(self, object):
@@ -706,7 +827,7 @@ class MeltdownBakeOp(Operator):
             data = object.data
                
             bpy.data.scenes["MD_TMP"].objects.unlink(object)
-            bpy.data.objects.remove(object)
+            bpy.data.objects.remove(object, do_unlink=True)
             
             if data is None:
                 return
@@ -728,7 +849,7 @@ class MeltdownBakeOp(Operator):
         print("cleanup remove_objects")
         for object in scene.objects:
             self.remove_object(object)
-            
+        
         print("cleanup remove_scene")
         bpy.data.scenes.remove(scene, do_unlink=True)    
         
@@ -754,26 +875,97 @@ class MeltdownBakeOp(Operator):
                     blocks.remove(block, do_unlink=True)
         
         print("cleanup remove_world")
-        # Dirty hack to clean world's user - as i don't know who is using it
-        # bpy.data.worlds["MD_TMP"].user_clear()
         bpy.data.worlds.remove(bpy.data.worlds["MD_TMP"], do_unlink=True)
-                 
-    def compo_nodes_margin(self, job, bakepass, pair, targetimage):
-        print("compo_nodes_margin")
-        bpy.ops.scene.new(type = "EMPTY")
-        bpy.context.scene.name = "MD_COMPO"
+    
+    def compo_nodes_margin_without_sharpness(self, job, bakepass, targetimage):
+    
+        
+        if bpy.context.scene.name == "MD_COMPO":
+            pass
+        else:
+            bpy.ops.scene.new(type = "EMPTY")
+            bpy.context.scene.name = "MD_COMPO"
+                
         scene = bpy.context.scene
         
         # make sure the compositor is using nodes
         scene.use_nodes = True
         # make sure the scene use compositor
         scene.render.use_compositing = True
-        scene.render.resolution_x = job.resolution_x
-        scene.render.resolution_y = job.resolution_y
+        scene.render.resolution_x = job.resolutionX
+        scene.render.resolution_y = job.resolutionY
         scene.render.resolution_percentage = 100
-        scene.render.filepath = bakepass.get_filepath(job, pair)
         scene.render.image_settings.compression = 0
         scene.render.image_settings.file_format = job.output_format
+        scene.render.filepath = bakepass.get_filepath(job)
+        
+        filename = bakepass.get_filename(job)
+        
+        if bpy.data.images.find(filename) > -1:
+            bpy.data.images.remove(bpy.data.images[filename] ,do_unlink = True)
+            
+        tree = scene.node_tree
+        
+        # get rid of all nodes
+        for node in tree.nodes:
+            tree.nodes.remove(node)
+        # make a dictionary of all the nodes we're going to need
+        # the vector is for placement only, otherwise useless
+        nodes = {
+            "Image": ["CompositorNodeImage", (-900.0, 100.0)],
+            "Output": ["CompositorNodeComposite", (200.0, 100.0)]
+        }
+        
+        # add all the listed nodes
+        for key, node_data in nodes.items():
+            node = tree.nodes.new(type = node_data[0])
+            node.location = node_data[1]
+            node.name = key
+            node.label = key
+            
+        links = [
+            ["Image", "Image", "Output", "Image"]
+        ]
+        
+        for link in links:
+            output = tree.nodes[link[0]].outputs[link[1]]
+            input = tree.nodes[link[2]].inputs[link[3]]
+            tree.links.new(output, input)
+
+        targetimage.scale(job.resolutionX,job.resolutionY)
+        tree.nodes["Image"].image = targetimage
+
+        bpy.ops.render.render(write_still = True, scene = "MD_COMPO")
+        
+        aa = job.antialiasing   #revert image size to original size for next bake
+        if aa == '2':
+            targetimage.scale(job.resolutionX*2,job.resolutionY*2)
+        if aa == '4':
+            targetimage.scale(job.resolutionX*4,job.resolutionY*4)
+       
+    def compo_nodes_margin(self, job, bakepass, targetimage):
+        print("compo_nodes_margin")
+       
+        bpy.ops.scene.new(type = "EMPTY")
+        bpy.context.scene.name = "MD_COMPO"
+        
+        scene = bpy.context.scene
+        
+        # make sure the compositor is using nodes
+        scene.use_nodes = True
+        # make sure the scene use compositor
+        scene.render.use_compositing = True
+        scene.render.resolution_x = job.resolutionX
+        scene.render.resolution_y = job.resolutionY
+        scene.render.resolution_percentage = 100
+        scene.render.image_settings.compression = 0
+        scene.render.image_settings.file_format = job.output_format
+        scene.render.filepath = bakepass.get_filepath(job)
+        
+        filename = bakepass.get_filename(job)
+        
+        if bpy.data.images.find(filename) > -1:
+            bpy.data.images.remove(bpy.data.images[filename] ,do_unlink = True)
         
         tree = scene.node_tree
         
@@ -833,16 +1025,24 @@ class MeltdownBakeOp(Operator):
             output = tree.nodes[link[0]].outputs[link[1]]
             input = tree.nodes[link[2]].inputs[link[3]]
             tree.links.new(output, input)
-
-        if job.antialiasing == True:
+        
+        if job.antialiasing == '0':
+            margin = job.margin
+            filter_width = 0.0
+            print("filter "+str(filter_width))
+            transform_scale = 1
+            
+        if job.antialiasing == '2':
             margin = job.margin*2
             filter_width = (1.0-job.aa_sharpness)/2.0
             print("filter "+str(filter_width))
             transform_scale = 0.5
-        else:
-            margin = job.margin
-            filter_width = 0.0            
-            transform_scale = 1.0
+            
+        if job.antialiasing == '4':
+            margin = job.margin*4
+            filter_width = (1.0-job.aa_sharpness)/2.0
+            print("filter "+str(filter_width))
+            transform_scale = 0.25
         
         tree.nodes["Image"].image = targetimage
         tree.nodes["Inpaint"].distance = margin
@@ -864,33 +1064,66 @@ class MeltdownBakeOp(Operator):
         bpy.ops.render.render(write_still = True, scene = "MD_COMPO")
         bpy.ops.scene.delete()
     
+    def scan_empty_mat(self, scene, jobs):
+        res = False
+        for job in jobs:
+            pairs = [pair for pair in job.pairs if pair.activated]                    
+            for pair in pairs: 
+                if pair.highpoly != "":
+                    if pair.hp_obj_vs_group == "GRP":
+                        for object in bpy.data.groups[pair.highpoly].objects:
+                            if object.type == 'EMPTY' and object.dupli_group:
+                                continue
+                            if len(object.material_slots)==0 or object.material_slots[0].material is None:
+                                self.report({'INFO'}, 'Object: '+object.name+' has no Material!')
+                                res = True
+                    else:
+                        if bpy.data.objects[pair.highpoly].type == 'EMPTY' and bpy.data.objects[pair.highpoly].dupli_group:
+                            continue #return False  #prevent detecting empty mat on duplifaces
+                        if len(bpy.data.objects[pair.highpoly].material_slots)==0 or bpy.data.objects[pair.highpoly].material_slots[0].material is None:
+                            self.report({'INFO'}, 'Object: '+bpy.data.objects[pair.highpoly].name+' has no Material!')
+                            res = True
+        return res
+       
     def execute(self, context):
         
-        src_scene = context.scene
-        jobs = [job for job in src_scene.meltdown_settings.jobs if job.activated]
         wm = context.window_manager
+        src_scene = context.scene
+        
+        jobs = [job for job in src_scene.meltdown_settings.jobs if job.activated]
         if len(jobs) < 1:
             self.report({'INFO'}, "No job found in queue, use Add job.")
-            return {"FINISHED"}
+            return {'CANCELLED'}
             
+        if self.scan_empty_mat(src_scene, jobs):
+            return {'CANCELLED'}
+            
+        # ensure save path exists
+        for job in jobs:
+            if not os.path.exists(bpy.path.abspath(job.output)):
+                try:
+                    os.makedirs(bpy.path.abspath(job.output))
+                except Exception as e:
+                    self.report({'INFO'}, "Directory "+job.output+" is not writable.")
+                    return {'CANCELLED'}   
+        
+        meltdown_osd.start()
+        
         with ProgressReport(wm) as progress:  # Not giving a WindowManager here will default to console printing.
             progress.enter_substeps(len(jobs))
+            
+            bpy.ops.meltdown.remove_baked_material()
+            
             for job in jobs:
                 
-                # ensure save path exists
-                if not os.path.exists(bpy.path.abspath(job.output)):
-                    os.makedirs(bpy.path.abspath(job.output))
-                    
                 bakepasses = [bakepass for bakepass in job.bakepasses if bakepass.activated]
                 progress.enter_substeps(len(bakepasses))
-                    
+                
                 for bakepass in bakepasses:
-                    self.bake_pass(progress, src_scene, job, bakepass)
+                    self.bake_pass(context, progress, src_scene, job, bakepass)
                 
                 progress.leave_substeps()
                 
-            bpy.data.images["MDtarget"].user_clear()
-            bpy.data.images.remove(bpy.data.images["MDtarget"])
             
             # Create material with baked maps
             bpy.ops.meltdown.create_baked_material()
@@ -898,7 +1131,9 @@ class MeltdownBakeOp(Operator):
             # Show up result
             bpy.ops.meltdown.switch_materials(engine='BLENDER_RENDER', link='OBJECT',all_objects=False)
             progress.leave_substeps("Finished !")
-               
+        
+        meltdown_osd.end()
+        
         return {'FINISHED'}
 
 class MeltdownAddPairOp(Operator):
@@ -983,37 +1218,54 @@ class MeltdownUnwrap(Operator):
         ob = bpy.context.active_object
         mesh = ob.data
         ob.update_from_editmode()
+        
+        # setup precistion from margin and resolution
+        #precision = 4.0 * setup.margin / min(int(setup.resolutionX), int(setup.resolutionY))
+        #setup.smart_unwrap.island_margin = precision
+        #setup.lightmap_unwrap.PREF_MARGIN_DIV = precision
+        
+        # use textureAtlas uv if any
+        uvtex_name = 'Auto-Unwrap'
+        if hasattr(scene, "ms_lightmap_groups"):        
+            textureAtlasGroupsNames = [group.name for group in scene.ms_lightmap_groups]        
+            for group in ob.users_group:
+                if group.name in textureAtlasGroupsNames:
+                    uvtex_name = group.name
+                    break
+        
         for uvtex in ob.data.uv_textures:
-            if uvtex.name == 'Auto-Unwrap':
+            if uvtex.name == uvtex_name:
                 uvtex.active = True
                 bpy.ops.object.mode_set(mode='OBJECT')
                 self.report({'INFO'}, "Auto Unwrap found skipping.")
                 return {'FINISHED'}
+                
         bpy.ops.mesh.uv_texture_add()
         ob.data.uv_textures[len(ob.data.uv_textures)-1].name = 'Auto-Unwrap'
         ob.data.uv_textures[len(ob.data.uv_textures)-1].active = True
+
         if setup.auto_unwrap == 'UNWRAP':
             bpy.ops.uv.unwrap()
             self.report({'INFO'}, "Reset UVS using your marked seams.")
-        else: 
-            if setup.auto_unwrap == 'SMART':
-                p = setup.smart_unwrap
-                bpy.ops.uv.smart_project(angle_limit=p.angle_limit, island_margin=p.island_margin, user_area_weight=p.user_area_weight, \
-                                         use_aspect=p.use_aspect, stretch_to_bounds=p.stretch_to_bounds)
-                self.report({'INFO'}, "Reset UVS using Smart UV Project.")
         
-            if setup.auto_unwrap == 'LIGHTMAP':
-                p = setup.lightmap_unwrap
-                bpy.ops.uv.lightmap_pack(PREF_CONTEXT=p.PREF_CONTEXT, PREF_PACK_IN_ONE=p.PREF_PACK_IN_ONE, PREF_NEW_UVLAYER=p.PREF_NEW_UVLAYER, \
-                                         PREF_APPLY_IMAGE=p.PREF_APPLY_IMAGE, PREF_IMG_PX_SIZE=p.PREF_IMG_PX_SIZE, PREF_BOX_DIV=p.PREF_BOX_DIV, \
-                                         PREF_MARGIN_DIV=p.PREF_MARGIN_DIV)
-                self.report({'INFO'}, "Reset UVS using Lightmap pack.")
-        
+        if setup.auto_unwrap == 'SMART':
+            p = setup.smart_unwrap
+            bpy.ops.uv.smart_project(angle_limit=p.angle_limit, island_margin=p.island_margin, user_area_weight=p.user_area_weight, \
+                                     use_aspect=p.use_aspect, stretch_to_bounds=p.stretch_to_bounds)
+            self.report({'INFO'}, "Reset UVS using Smart UV Project.")
+    
+        if setup.auto_unwrap == 'LIGHTMAP':
+            p = setup.lightmap_unwrap
+            bpy.ops.uv.lightmap_pack(PREF_CONTEXT=p.PREF_CONTEXT, PREF_PACK_IN_ONE=p.PREF_PACK_IN_ONE, PREF_NEW_UVLAYER=p.PREF_NEW_UVLAYER, \
+                                     PREF_APPLY_IMAGE=p.PREF_APPLY_IMAGE, PREF_IMG_PX_SIZE=p.PREF_IMG_PX_SIZE, PREF_BOX_DIV=p.PREF_BOX_DIV, \
+                                     PREF_MARGIN_DIV=p.PREF_MARGIN_DIV)
+            self.report({'INFO'}, "Reset UVS using Lightmap pack.")
+    
         bpy.ops.object.mode_set(mode='OBJECT')
         return {'FINISHED'}
-
-class MeltdownMakeClearSetupPassOp(Operator):
-    '''Setup pass jobs for selection'''
+        
+class MeltdownClearSetupPassOp(Operator):
+    '''Clear pass jobs for selection'''
 
     bl_idname = "meltdown.clear_setup"
     bl_label = "Clear jobs"
@@ -1023,11 +1275,11 @@ class MeltdownMakeClearSetupPassOp(Operator):
         scene.meltdown_settings.jobs.clear()        
         return {'FINISHED'}
         
-class MeltdownMakeSetupPassOp(Operator):
-    '''Setup pass jobs for selection'''
+class MeltdownMakeAtlasSetupPassOp(Operator):
+    '''Setup atlas pass jobs for selection'''
 
-    bl_idname = "meltdown.add_setup"
-    bl_label = "Add job"
+    bl_idname = "meltdown.add_setup_atlas"
+    bl_label = "Atlas job"
     
     def execute(self, context):
         scene = context.scene
@@ -1042,9 +1294,38 @@ class MeltdownMakeSetupPassOp(Operator):
         job.output = settings.output
         job.output_format = settings.output_format
         job.antialiasing = settings.antialiasing
-        job.resolution_x = settings.resolution_x
-        job.resolution_y = settings.resolution_y
+        job.resolutionX = int(settings.resolutionX)
+        job.resolutionY = int(settings.resolutionY)
         
+        # texture atlas
+        if hasattr(scene, "ms_lightmap_groups"):
+            # make texture atlas group and auto-unwrap
+            if len(objs) > 1:
+                # find if all objects are allready unwrapped
+                textureAtlasGroupsNames = [group.name for group in scene.ms_lightmap_groups]        
+                do_unwrap = False
+                for obj in objs:
+                    if len(obj.users_group) < 1:
+                        do_unwrap = True
+                        break
+                    for group in obj.users_group:
+                        if group.name not in textureAtlasGroupsNames:
+                            do_unwrap = True
+                            break
+                # perform auto texture atlas unwrap
+                if do_unwrap:        
+                    bpy.ops.scene.ms_add_lightmap_group()
+                    group = scene.ms_lightmap_groups[scene.ms_lightmap_groups_index]
+                    group.resolutionX = settings.resolutionX
+                    group.resolutionY = settings.resolutionY
+                    if settings.auto_unwrap == 'SMART':
+                        group.autoUnwrapPrecision = settings.smart_unwrap.island_margin
+                        group.unwrap_type = '0'
+                    else:
+                        group.autoUnwrapPrecision = settings.lightmap_unwrap.PREF_MARGIN_DIV
+                        group.unwrap_type = '1'
+                    bpy.ops.object.ms_auto()
+            
         for obj in objs:
             scene.objects.active = obj
             bpy.ops.meltdown.unwrap()            
@@ -1061,7 +1342,46 @@ class MeltdownMakeSetupPassOp(Operator):
                         pass
         
         return {'FINISHED'}
-       
+
+class MeltdownMakeUniqueSetupPassOp(Operator):
+    '''Setup unique pass jobs for selection'''
+
+    bl_idname = "meltdown.add_setup_by_object"
+    bl_label = "Object job"
+    
+    def execute(self, context):
+        scene = context.scene
+        objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        settings = scene.meltdown_setup
+        meltdown_settings = scene.meltdown_settings
+        #meltdown_settings.jobs.clear()
+        for obj in objs:
+            scene.objects.active = obj
+            bpy.ops.meltdown.unwrap() 
+            
+            # each job share objects and pass settings
+            job = meltdown_settings.jobs.add()
+            job.expand = False
+            job.output = settings.output
+            job.output_format = settings.output_format
+            job.antialiasing = settings.antialiasing
+            job.resolutionX = int(settings.resolutionX)
+            job.resolutionY = int(settings.resolutionY)
+            
+            pair = job.pairs.add()
+            pair.lowpoly = obj.name
+        
+            for bake_pass in settings.bakepasses:
+                new_bake_pass = job.bakepasses.add()
+                for attr in dir(bake_pass):
+                    if hasattr(bake_pass, attr):
+                        try:
+                            setattr(new_bake_pass, attr, getattr(bake_pass, attr))
+                        except:
+                            pass
+        
+        return {'FINISHED'}
+        
 class MeltdownSwitchMaterialOp(Operator):
     '''Switch engine and materials'''
 
@@ -1156,7 +1476,7 @@ class MeltdownEnableBakedMaterialOp(Operator):
         bpy.ops.meltdown.switch_materials(engine='BLENDER_RENDER', link='OBJECT')
         context.scene.meltdown_setup.material_mode = 'BAKED'
         return {'FINISHED'}    
-
+          
 class MeltdownMakeBIMaterialOp(Operator):
     '''Setup rendered images in Blender Internal maps'''
 
@@ -1166,10 +1486,27 @@ class MeltdownMakeBIMaterialOp(Operator):
     def execute(self, context):
         scene = context.scene
         jobs  = scene.meltdown_settings.jobs
+        # Check for texture atlas group membership
+        # and use group name as uvtex_name if any
+        
+        if hasattr(scene, "ms_lightmap_groups"):        
+            textureAtlasGroupsNames = [group.name for group in scene.ms_lightmap_groups]
+        else:
+            textureAtlasGroupsNames = []
+                    
         for job in jobs:
+            
+            
             for pair in job.pairs:
                 obj = scene.objects[pair.lowpoly]
                 obj["bake_object"] = True
+                
+                # check for texture atlas group membership
+                # and use group name as uv name if any
+                uvtex_name = 'Auto-Unwrap'
+                for group in obj.users_group:
+                    if group.name in textureAtlasGroupsNames:
+                        uvtex_name = group.name
                 
                 mat = None
                 for name, slot in obj.material_slots.items():
@@ -1188,8 +1525,8 @@ class MeltdownMakeBIMaterialOp(Operator):
                 for i, slot in enumerate(mat.texture_slots):
                     if slot is not None:
                         mat.texture_slots.clear(i)
-                
-                # realy clean up everything, still left to check for particles
+                    
+                # clean up datablocks
                 attrs = ["textures", "images"]
                 
                 print("cleanup old baked textures and images")    
@@ -1204,8 +1541,8 @@ class MeltdownMakeBIMaterialOp(Operator):
                 # Setup Blender Internal material with baked maps
                 for j, bake_pass in enumerate(bakepasses):
                     slot = self.find_empty_slot(mat)
-                    filename = bake_pass.get_filename(job, pair)
-                    filepath = bake_pass.get_filepath(job, pair)
+                    filename = bake_pass.get_filename(job)
+                    filepath = bake_pass.get_filepath(job)
                     tex = bpy.data.textures.new(name=filename, type='IMAGE')
                     img_idx = bpy.data.images.find(filename)
                     if img_idx > -1:
@@ -1217,7 +1554,7 @@ class MeltdownMakeBIMaterialOp(Operator):
                     self.config_texture_slot(bake_pass, slot, tex, image)
                     slot.texture = tex
                     slot.texture_coords = 'UV'
-                    slot.uv_layer = 'Auto-Unwrap'
+                    slot.uv_layer = uvtex_name
                     
                 # assign baked result material to object
                 for name, slot in obj.material_slots.items():
@@ -1304,6 +1641,50 @@ class MeltdownMakeBIMaterialOp(Operator):
     def sort_bake_passes(self, bakepasses):
         return sorted(bakepasses, key=self.get_pass_order)
 
+class MeltdownClearBIMaterialOp(Operator):
+    '''Clear rendered images in Blender Internal maps'''
+
+    bl_idname = "meltdown.remove_baked_material"
+    bl_label = "Clear rendered maps in BI"
+    
+    def execute(self, context):
+        scene = context.scene
+        jobs  = scene.meltdown_settings.jobs
+        for job in jobs:
+            for pair in job.pairs:
+                obj = scene.objects[pair.lowpoly]
+                obj["bake_object"] = True
+                
+                mat = None
+                for name, slot in obj.material_slots.items():
+                    slot.link = 'OBJECT'
+                    if slot.material is not None:
+                        mat = slot.material
+                        break
+                        
+                if mat is None:
+                    continue
+                    
+                bpy.data.materials.remove(mat, do_unlink=True)
+                
+                # realy clean up everything, still left to check for particles
+                attrs = ["textures", "images"]
+                
+                print("cleanup old baked textures and images")    
+                for attr in attrs:
+                    blocks = getattr(bpy.data, attr)
+                    for block in blocks:
+                        if block.users < 1:
+                            blocks.remove(block, do_unlink=True)
+                
+                # assign baked result material to object
+                for name, slot in obj.material_slots.items():
+                    slot.link = 'OBJECT'
+                    slot.material = None
+                    slot.link = 'DATA'                   
+        
+        return {'FINISHED'}
+          
 class SmartUnwrapProps(PropertyGroup):
     bl_idname = 'meltdown.smart_unwrap'
     
@@ -1399,11 +1780,37 @@ class MeltdownSetup(PropertyGroup):
     
     lightmap_unwrap = PointerProperty(type=LightmapUnwrapProps)
     smart_unwrap = PointerProperty(type=SmartUnwrapProps)
-    
+    expand_unwrap = BoolProperty(name = "Expand unwrap", default = True)
+    expand_resolution = BoolProperty(name = "Expand resolution", default = True)
     expand = BoolProperty(name = "Expand", default = True)
-    resolution_x = IntProperty(name="Resolution X", default = 1024)
-    resolution_y = IntProperty(name="Resolution Y", default = 1024)
-    antialiasing = BoolProperty(name="4x Antialiasing", description="", default=False)
+    resolutionX = EnumProperty(
+        name="X",
+        items=(('256', '256', ''),
+               ('512', '512', ''),
+               ('1024', '1024', ''),
+               ('2048', '2048', ''),
+               ('4096', '4096', ''),
+               ('8192', '8192', ''),
+               ('16384', '16384', ''),
+               ),
+        default='1024'
+    )
+    resolutionY = EnumProperty(
+        name="Y",
+        items=(('256', '256', ''),
+               ('512', '512', ''),
+               ('1024', '1024', ''),
+               ('2048', '2048', ''),
+               ('4096', '4096', ''),
+               ('8192', '8192', ''),
+               ('16384', '16384', ''),
+               ),
+        default='1024'
+    )
+    antialiasing = EnumProperty(name = "Anti-aliasing", default = "0",
+                                items = (("0","None",""),
+                                        ("2", "2x", ""),
+                                         ("4","4x","")))
     aa_sharpness = FloatProperty(name="AA Sharpness", description="", default=0.5, min = 0.0, max = 1.0)
     
     margin = IntProperty(name="Margin", default = 16, min = 0)
@@ -1415,7 +1822,7 @@ class MeltdownSetup(PropertyGroup):
     output_format = EnumProperty(name="Format", 
         description = 'The file format of the output images.',
         items=enum_file_formats, 
-        default="PNG")
+        default="TIFF")
     bakepasses = CollectionProperty(type=BakePass)
     material_mode = EnumProperty(name="Show materials", items=(("CYCLES","Cycles",""),("BLENDER_RENDER","Blender Internal",""),("BAKED","Baked bi","")))
     
@@ -1458,45 +1865,57 @@ class MeltdownSetupPanel(bpy.types.Panel):
         edit = context.user_preferences.edit
         wm = context.window_manager
         setup = context.scene.meltdown_setup
+        
         box = layout.box()
         row = box.row(align=True)
-        row.prop(setup, "auto_unwrap")
+        if setup.expand_unwrap:
+            row.prop(setup, "expand_unwrap", icon="TRIA_DOWN", icon_only=True, text="Unwrap", emboss=False)
+        else:
+            row.prop(setup, "expand_unwrap", icon="TRIA_RIGHT", icon_only=True, text="Unwrap", emboss=False)
         
-        if setup.auto_unwrap == 'SMART':
-            setup.smart_unwrap.draw(box)
-        if setup.auto_unwrap == 'LIGHTMAP':
-            setup.lightmap_unwrap.draw(box)
+        row.prop(setup, "auto_unwrap", text="")
+        
+        if setup.expand_unwrap:
+            if setup.auto_unwrap == 'SMART':
+                setup.smart_unwrap.draw(box)
+            if setup.auto_unwrap == 'LIGHTMAP':
+                setup.lightmap_unwrap.draw(box)
             
         box = layout.box()
         row = box.row(align=True)
-        row.label(text="Resolution")
-        row = box.row(align=True)
-        row.alignment = 'EXPAND'
-        row.prop(setup, 'resolution_x', text="X")
-        row.prop(setup, 'resolution_y', text="Y")      
-        row = box.row(align=True)
-        row.alignment = 'EXPAND'
-        row.prop(setup, 'antialiasing', text="4x Antialiasing")
-        if setup.antialiasing == True:
+        if setup.expand_resolution:
+            row.prop(setup, "expand_resolution", icon="TRIA_DOWN", icon_only=True, text="Resolution", emboss=False) 
+            row.prop(setup, 'resolutionX', text="")
+            row.prop(setup, 'resolutionY', text="")      
             row = box.row(align=True)
             row.alignment = 'EXPAND'
-            row.prop(setup, 'aa_sharpness', text="AA sharpness")
-        row = box.row(align=True)
-        row.alignment = 'EXPAND'
-        row.prop(setup, 'margin', text="Margin")
-        row = box.row(align=True)
-        row.alignment = 'EXPAND'
-        row.prop(setup, 'output', text="Path")
-        row = box.row(align=True)
-        row.alignment = 'EXPAND'
-        row.prop(setup, 'output_format', text="Format")
-        
-        row = layout.row(align=True)
+            row.prop(setup, 'antialiasing')
+            if setup.antialiasing != '0':
+                row = box.row(align=True)
+                row.alignment = 'EXPAND'
+                row.prop(setup, 'aa_sharpness', text="AA sharpness")
+                
+            row = box.row(align=True)
+            row.alignment = 'EXPAND'
+            row.prop(setup, 'margin', text="Margin")
+            row = box.row(align=True)
+            row.alignment = 'EXPAND'
+            row.prop(setup, 'output', text="Path")
+            row = box.row(align=True)
+            row.alignment = 'EXPAND'
+            row.prop(setup, 'output_format', text="Format")
+        else:
+            row.prop(setup, "expand_resolution", icon="TRIA_RIGHT", icon_only=True, text="Resolution", emboss=False)
+            row.prop(setup, 'resolutionX', text="")
+            row.prop(setup, 'resolutionY', text="")   
+            
+        passbox = layout.box()
+        row = passbox.row(align=True)
         row.alignment = 'EXPAND'
         if setup.expand == False: 
             row.prop(setup, "expand", icon="TRIA_RIGHT", icon_only=True, text="Passes", emboss=False)
             for pass_i, bakepass in enumerate(setup.bakepasses):
-                row = layout.row(align=True)
+                row = passbox.row(align=True)
                 row.alignment = 'EXPAND'
                 
                 bakepass.draw(row, expand=False)
@@ -1530,14 +1949,16 @@ class MeltdownSetupPanel(bpy.types.Panel):
                 else:
                     row.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_ON", emboss = False)
 
-        row = layout.row(align=True)
+        row = passbox.row(align=True)
         row.alignment = 'EXPAND'
         row.operator("meltdown.add_setup_pass", icon = "ZOOMIN")
         row.separator()
+        
         box = layout.box()
         row = box.row(align=True)
         row.alignment = 'EXPAND'
-        row.operator("meltdown.add_setup", icon = "SCRIPT")
+        row.operator("meltdown.add_setup_atlas", icon = "ZOOMIN")
+        row.operator("meltdown.add_setup_by_object", icon = "ZOOMIN")
         row.operator("meltdown.clear_setup", icon = "CANCEL")
         
         row = box.row(align=True)
@@ -1588,11 +2009,17 @@ class MeltdownJobsPanel(bpy.types.Panel):
         
         for job_i, job in enumerate(mds.jobs):
             
-            row = layout.row(align=True)
-            row.alignment = 'EXPAND'
-            
+            if len(job.pairs) > 1:
+                label = job.make_filename(context) + " : "+str(len(job.pairs))+ " Objects"
+            else:
+                label = bpy.path.clean_name(job.make_filename(context), replace=' ')
+                
             if job.expand == False: 
-                row.prop(job, "expand", icon="TRIA_RIGHT", icon_only=True, text=str(len(job.pairs))+" Objects", emboss=False)
+                box = layout.box()
+                row = box.row(align=True)
+                row.alignment = 'EXPAND'
+                
+                row.prop(job, "expand", icon="TRIA_RIGHT", icon_only=True, text=label, emboss=False)
                 
                 if job.activated:
                     row.prop(job, "activated", icon_only=True, icon = "RESTRICT_RENDER_OFF", emboss = False)
@@ -1602,7 +2029,9 @@ class MeltdownJobsPanel(bpy.types.Panel):
                 rem = row.operator("meltdown.rem_job", text = "", icon = "X")
                 rem.job_index = job_i  
             else:
-                row.prop(job, "expand", icon="TRIA_DOWN", icon_only=True, text=str(len(job.pairs))+" Objects", emboss=False)
+                row = layout.row(align=True)
+                row.alignment = 'EXPAND'
+                row.prop(job, "expand", icon="TRIA_DOWN", icon_only=True, text=label, emboss=False)
                 
                 if job.activated:
                     row.prop(job, "activated", icon_only=True, icon = "RESTRICT_RENDER_OFF", emboss = False)
@@ -1611,32 +2040,32 @@ class MeltdownJobsPanel(bpy.types.Panel):
 
                 rem = row.operator("meltdown.rem_job", text = "", icon = "X")
                 rem.job_index = job_i            
-                
-                row = layout.row(align=True)
+                box = layout.box()
+                row = box.row(align=True)
                 row.alignment = 'EXPAND'
-                row.prop(job, 'resolution_x', text="X")
-                row.prop(job, 'resolution_y', text="Y")
+                row.prop(job, 'resolutionX', text="X")
+                row.prop(job, 'resolutionY', text="Y")
                 
-                row = layout.row(align=True)
+                row = box.row(align=True)
                 row.alignment = 'EXPAND'
-                row.prop(job, 'antialiasing', text="4x Antialiasing")
+                row.prop(job, 'antialiasing')
                 
                 
-                if job.antialiasing == True:
-                    row = layout.row(align=True)
+                if job.antialiasing != '0':
+                    row = box.row(align=True)
                     row.alignment = 'EXPAND'
                     row.prop(job, 'aa_sharpness', text="AA sharpness")
                 
-                row = layout.row(align=True)
+                row = box.row(align=True)
                 row.alignment = 'EXPAND'
                 row.prop(job, 'margin', text="Margin")
                 
                 
-                row = layout.row(align=True)
+                row = box.row(align=True)
                 row.alignment = 'EXPAND'
                 row.prop(job, 'output', text="Path")
                 
-                row = layout.row(align=True)
+                row = box.row(align=True)
                 row.alignment = 'EXPAND'
                 row.prop(job, 'output_format', text="Format")
                 
@@ -1680,21 +2109,39 @@ class MeltdownJobsPanel(bpy.types.Panel):
                 addpair = row.operator("meltdown.add_pair", icon = "ZOOMIN")
                 addpair.job_index = job_i
                 
-                for pass_i, bakepass in enumerate(job.bakepasses):
-                    row = layout.row(align=True)
-                    row.alignment = 'EXPAND'
-                    box = row.box().column(align=True)
-                    box.separator()
-                    bakepass.draw(box)
-                    col = row.column()
-                    row = col.row()
-                    if bakepass.activated:
-                        row.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_OFF", emboss = False)
-                    else:
-                        row.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_ON", emboss = False)
-                      
-                row = layout.row(align=True)
+                passbox = layout.box()
+                row = passbox.row(align=True)
                 row.alignment = 'EXPAND'
+                
+                if job.expand_passes == False: 
+                    row.prop(job, "expand_passes", icon="TRIA_RIGHT", icon_only=True, text="Passes", emboss=False)
+                    for pass_i, bakepass in enumerate(job.bakepasses):
+                        row = passbox.row(align=True)
+                        row.alignment = 'EXPAND'
+                        bakepass.draw(row, expand=False)
+                        col = row.column()
+                        if bakepass.activated:
+                            col.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_OFF", emboss = False)
+                        else:
+                            col.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_ON", emboss = False) 
+                else:
+                    row.prop(job, "expand_passes", icon="TRIA_DOWN", icon_only=True, text="Passes", emboss=False)
+                        
+                    for pass_i, bakepass in enumerate(job.bakepasses):
+                        row = layout.row(align=True)
+                        row.alignment = 'EXPAND'
+                        box = row.box().column(align=True)
+                        box.separator()
+                        bakepass.draw(box)
+                        col = row.column()
+                        row = col.row()
+                        if bakepass.activated:
+                            row.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_OFF", emboss = False)
+                        else:
+                            row.prop(bakepass, "activated", icon_only=True, icon = "RESTRICT_RENDER_ON", emboss = False)
+
+                row = passbox.row(align=True)
+                #row.alignment = 'EXPAND'
                 addpass = row.operator("meltdown.add_pass", icon = "ZOOMIN")
                 addpass.job_index = job_i
                 
